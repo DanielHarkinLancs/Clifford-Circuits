@@ -1,0 +1,301 @@
+import numpy as np
+from numpy.random import choice
+import scipy.sparse
+import sympy as sp
+import matplotlib as plt
+import random
+import routines_tab
+import pandas as pd
+import re
+import stim
+import matplotlib.pyplot as plt 
+from tqdm import tqdm
+
+from routines_tab import allGates
+
+#np.random.seed(42)
+#random.seed(42)
+def lst_gen(lst):
+    for item in lst:
+        yield item
+def canonical_form_reduction(tab):
+    """
+    Canonical form reduction for stabilizer matrices using the Tab class.
+    """
+    return routines_tab.Tab_phaseful(tab=np.array(sp.Matrix(tab.tab).echelon_form()%2).astype(np.int64))
+def random_pauli(L):
+    G = ['X','Y','Z']
+    u=[]
+    o=[]
+    for _ in range(L):
+        string = routines_tab.Tab_phaseful(L)
+        a = random.choice(G)
+        b = random.randrange(L)
+        if a == 'X':
+            string.X(b)
+        if a == 'Y':
+            string.Y(b)
+        if a == 'Z':
+            string.Z(b)
+        u.append(a)
+        o.append(b)
+    return string,u,o
+def synthesis_basis_normalization_circuit_stim(tab):
+    """
+    Synthesis of basis normalization circuit using the Tab class.
+    """
+    raw_stabilizers = tab.to_stabilizers(canonicalize=True)
+    tab = stim.Tableau.from_stabilizers(raw_stabilizers) # Assuming GAUSS(M) reduces M to canonical form
+    
+    C = []  # Unitary stabilizer circuit
+    i = 0
+    
+    Q_pauli = [tab.z_output(k) for k in range(len(tab))]+[tab.x_output(k) for k in range(len(tab))]
+    
+    Q = [list(str(A))[1:] for A in Q_pauli]
+    
+    n=len(tab)
+    
+    for j in range(n):
+        # Apply block of Hadamard gates
+        a = np.array([b[j] for b in Q[i:]])
+        k = np.where((a == 'X')| (a=='Y'))[0]  # Find the row with jth literal set to X or Y
+        
+        if len(k) > 0:
+            Q[i],Q[k[0]+i]= Q[k[0]+i],Q[i]
+            Q_pauli[i],Q_pauli[k[0]+i]= Q_pauli[k[0]+i],Q_pauli[i]
+            
+        else:
+            k2 = np.where((a=='Z'))[0]  # Find the last row with jth literal set to Z
+            if len(k2)>1:
+                k2_ind=k2[-1]
+            if len(k2)==1:
+                k2_ind=k2[0]
+                
+            k2 += i  # Adjust index to the global row index
+            
+            if len(k2) > 0:
+                Q[i], Q[k2_ind+i] = Q[k2_ind+i], Q[i]  # ROWSWAP
+                Q_pauli[i], Q_pauli[k2_ind+i] = Q_pauli[k2_ind+i], Q_pauli[i]  # ROWSWAP
+                
+                a = np.array([b[1] for b in Q[i:]])
+                if len(np.where(a!='_')[0])>0:
+                    C.append(('H',j))
+                    zs = Q_pauli[:int(len(Q_pauli)/2)]
+                    xs = Q_pauli[int(len(Q_pauli)/2):] # CONJ(M, Hj)
+                    
+                    tab = stim.Tableau.from_conjugated_generators(xs=xs,zs=zs,)
+                    tab.prepend(stim.Tableau.from_named_gate("H", [j]))
+                    tab.append(stim.Tableau.from_named_gate("H", [j]))
+                    
+        i += 1
+    
+    for j in range(n-1):
+        # Apply block of CNOT gates
+        for k in range(j+1, n-1,1):
+            Q_pauli = [tab.z_output(m) for m in range(n)]+[tab.x_output(m) for m in range(n)]
+            Q = [list(str(A))[1:] for A in Q_pauli]
+            
+            if len(np.where((Q[j][k] == 'X') | (Q[j][k] == 'Y')))>0:  # X or Y
+                C.append(('CNOT',j,k))
+                
+                zs = Q_pauli[:int(len(Q_pauli)/2)]
+                xs = Q_pauli[int(len(Q_pauli)/2):] # CONJ(M, Hj)
+                    
+                tab = stim.Tableau.from_conjugated_generators(xs=xs,zs=zs,)
+                
+                tab.prepend(stim.Tableau.from_named_gate("CNOT"), [j,k]) # CONJ(M, CNOTj,k)
+                tab.append(stim.Tableau.from_named_gate("CNOT"), [j,k]) # CONJ(M, CNOTj,k)
+                
+    
+    for j in range(n-1):
+        # Apply block of CNOT gates
+        for k in range(j+1, n-1,1):
+            Q_pauli = [tab.z_output(m) for m in range(n)]+[tab.x_output(m) for m in range(n)]
+            Q = [list(str(A))[1:] for A in Q_pauli]
+            if Q[j][k] == 'Z':  # Z
+                C.append(('CPHASE',j,k))
+                
+                zs = Q_pauli[:int(len(Q_pauli)/2)]
+                xs = Q_pauli[int(len(Q_pauli)/2):] # CONJ(M, Hj)
+                    
+                tab = stim.Tableau.from_conjugated_generators(xs=xs,zs=zs,)
+                
+                tab.prepend(stim.Tableau.from_named_gate("H"), [j])
+                tab.prepend(stim.Tableau.from_named_gate("CNOT"), [j,k])
+                tab.prepend(stim.Tableau.from_named_gate("H"), [j]) # CONJ(M, CPHASEj,k)
+                tab.append(stim.Tableau.from_named_gate("H"), [j])
+                tab.append(stim.Tableau.from_named_gate("CNOT"), [j,k])
+                tab.append(stim.Tableau.from_named_gate("H"), [j])
+    
+    for j in range(n):
+        Q_pauli = [tab.z_output(m) for m in range(n)]+[tab.x_output(m) for m in range(n)]
+        Q = [list(str(A))[1:] for A in Q_pauli]
+        if Q[j][j] == 'Y':  # Y
+            C.append(('P',j))
+            
+            zs = Q_pauli[:int(len(Q_pauli)/2)]
+            xs = Q_pauli[int(len(Q_pauli)/2):] # CONJ(M, Hj)
+                    
+            tab = stim.Tableau.from_conjugated_generators(xs=xs,zs=zs,)
+            
+            tab.prepend(stim.Tableau.from_named_gate("S_DAG"), [j])  # CONJ(M, Pj)
+            tab.append(stim.Tableau.from_named_gate("S"), [j])
+    
+    for j in range(n-1):
+        Q_pauli = [tab.z_output(m) for m in range(n)]+[tab.x_output(m) for m in range(n)]
+        Q = [list(str(A))[1:] for A in Q_pauli]
+        if Q[j][j] == 'X':  # X
+            C.append(('H' ,j))
+            
+            zs = Q_pauli[:int(len(Q_pauli)/2)]
+            xs = Q_pauli[int(len(Q_pauli)/2):] # CONJ(M, Hj)
+                    
+            tab = stim.Tableau.from_conjugated_generators(xs=xs,zs=zs,)
+            
+            tab.prepend(stim.Tableau.from_named_gate("H"), [j])  # CONJ(M, Hj)
+            tab.append(stim.Tableau.from_named_gate("H"), [j])
+    
+    Q_pauli = [tab.z_output(m) for m in range(n)]+[tab.x_output(m) for m in range(n)]
+    
+    for j in range(n-1):
+        for k in range(j+1, n-1,1):
+            Q = [list(str(A))[1:] for A in Q_pauli]
+            if Q[k][j]=='Z':  # Z
+                Q_pauli[j] = Q_pauli[k]*Q_pauli[j]
+                #Q_pauli[j+n] = Q_pauli[k+n]*Q_pauli[j+n]
+                
+    zs = Q_pauli[:int(len(Q_pauli)/2)]
+    xs = Q_pauli[int(len(Q_pauli)/2):] 
+                    
+    #tab = stim.Tableau.from_conjugated_generators(xs=xs,zs=zs,)
+        
+    P = stim.Tableau(len(tab))
+    for a in C:
+                
+        if len(a)==2:
+            if a[0]=='P':
+                P.append(stim.Tableau.from_named_gate('S'), [a[1]])
+            else:
+                P.append(stim.Tableau.from_named_gate(a[0]), [a[1]])
+        else:
+            if a[0]=="CPHASE":
+                P.append(stim.Tableau.from_named_gate('H'), [a[1]])
+                P.append(stim.Tableau.from_named_gate('CNOT'), [a[1],a[2]])
+                P.append(stim.Tableau.from_named_gate('H'), [a[1]])
+            else:
+                
+                P.append(stim.Tableau.from_named_gate(a[0]), [a[1],a[2]])
+    return P
+def inner_product(M_phi, M_psi):
+    """
+    Calculate the inner product between stabilizer states represented by matrices M_psi and M_phi.
+    """
+    k = 0
+    # Step 1: Basis normalization circuit for M_psi
+    C = synthesis_basis_normalization_circuit_stim(M_psi)    
+    
+    # Step 2: Conjugate M_phi by the Clifford circuit C
+    M_phi = ((C.inverse()).then(M_phi))
+    M_phi = M_phi.then(C)
+    
+    # Step 3: Reduce M_phi to canonical form
+    raw_stabilizers = M_phi.to_stabilizers(canonicalize=True)
+    M_phi = stim.Tableau.from_stabilizers(raw_stabilizers)
+    
+    x_outs_phi = [M_phi.x_output(k) for k in range(len(M_phi))]
+    z_outs_phi = [M_phi.z_output(k) for k in range(len(M_phi))]
+
+    x_outs_psi = [M_psi.x_output(k) for k in range(len(M_psi))]
+    z_outs_psi = [M_psi.z_output(k) for k in range(len(M_psi))]
+
+    C_phi = z_outs_phi+x_outs_phi
+    C_psi = z_outs_psi+x_outs_psi
+    
+    print(C_phi)
+    for i in range(2*len(z_outs_phi)):
+        row = list(str(C_phi[i]))
+        print(row,i)
+        if 'X' in row or'Y' in row:
+            k=k+1
+        else:
+            R = stim.PauliString(len(z_outs_phi[0]))
+            B = np.where(np.array(list((str(z_outs_phi[0]))))=='Z')[0]
+            for j in B:
+                R = C_psi[j]*R
+            if R==-C_phi[i]:
+                return 0
+    return 2**(-k)
+def OTOC(L, T, M=100):
+    """""
+    Function to calcuate the OTOC for a circuit with stabilizer tableau, tab (from the phaseful class),
+    the number of qubits in the system is given by L, we generate T timesteps at each of which
+    we increase the number of gates by N (defaults to 25).
+    Inputs:
+        L: int giving the range of qubit sizes of the tableau
+        T: int giving the number of timesteps we will calculate the OTOC over.
+        M: int the number of random pauli strings to average over when finding the inner product of stabilizer 
+        states, defaults to 100.
+    
+    Outputs:
+        OTOC: np.array of size (L,T) containing the OTOC at each value.
+    """""
+    G = ['S','H','SQRT_X','SQRT_Y','SQRT_Z']
+    
+    OTOC = np.zeros((T,L))
+    
+    A = stim.Tableau(L)
+    a = random.choice(G)
+        
+    if a == 'SQRT_X':
+        A.append(stim.Tableau.from_named_gate('SQRT_X'), [0])
+    if a == 'SQRT_Y':
+        A.append(stim.Tableau.from_named_gate('SQRT_Y'), [0])
+    if a == 'SQRT_Z':
+        A.append(stim.Tableau.from_named_gate('SQRT_Z'), [0])
+    if a == 'S':
+        A.append(stim.Tableau.from_named_gate('S'), [0])
+    if a == 'H':
+        A.append(stim.Tableau.from_named_gate('H'), [0])
+            
+    b = random.choice(G)     
+    
+    for x in tqdm(range(1,L), desc="Loading..."):
+        B = stim.Tableau(L)
+        if b == 'SQRT_X':
+            B.append(stim.Tableau.from_named_gate('SQRT_X'), [x])
+        if b == 'SQRT_Y':
+            B.append(stim.Tableau.from_named_gate('SQRT_Y'), [x])
+        if b == 'SQRT_Z':
+            B.append(stim.Tableau.from_named_gate('SQRT_Z'), [x])
+        if b == 'S':
+            B.append(stim.Tableau.from_named_gate('S'), [x])
+        if b == 'H':
+            B.append(stim.Tableau.from_named_gate('H'), [x])
+                   
+        tab = stim.Tableau(L)
+        
+        for i in range(T):
+            
+            tab = tab.then(stim.Tableau.random(L))
+            
+            A_t = (tab.then(A)).then(tab.inverse())
+            
+            otoc_tab = (B).then(A_t)
+            otoc_tab = otoc_tab**2
+            
+            #Now we need dot product with pauli strings and sum up the results and divide by L=num of qubits.
+            otoc_val = 0
+            
+            for j in range(M):
+                #Code for a random pauli string in the routines.tab.Phaseful_tab
+                p = stim.PauliString.random(L)
+                M_psi = p
+                
+                M_phi = (p.to_tableau()).then(otoc_tab)
+                
+                OTOC[i,x] += inner_product(M_phi, M_psi.to_tableau())
+    
+    OTOC = (OTOC/M)*(2**L)
+            
+    return OTOC
